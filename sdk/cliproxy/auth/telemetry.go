@@ -55,6 +55,8 @@ type llmCallEvent struct {
 	InflightAtDispatch int       `json:"inflight_at_dispatch"`
 	Provider           string    `json:"provider"`
 	Account            string    `json:"account"`
+	SeatID             string    `json:"seat_id"`
+	AuthID             string    `json:"auth_id"`
 	Model              string    `json:"model"`
 	ModelRequested     string    `json:"model_requested,omitempty"`
 	Route              string    `json:"route"`
@@ -80,6 +82,8 @@ type callTelemetry struct {
 	inflight int
 	provider string
 	account  string
+	seatID   string
+	authID   string
 	model    string
 	modelReq string
 	route    string
@@ -103,6 +107,20 @@ func (t *callTelemetry) markQueued() {
 }
 
 // accountSlug derives a human identifier for the credential — never a secret.
+func exactAuthID(a *Auth) string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(a.ID)
+}
+
+func telemetrySeatID(meta map[string]any) string {
+	if seatID := seatIDFromMetadata(meta); seatID != "" {
+		return seatID
+	}
+	return "unattributed"
+}
+
 func accountSlug(a *Auth) string {
 	if a == nil {
 		return ""
@@ -180,6 +198,8 @@ func (m *Manager) beginCallTelemetry(ctx context.Context, provider string, a *Au
 		tsStart:  time.Now(),
 		provider: provider,
 		account:  accountSlug(a),
+		seatID:   telemetrySeatID(opts.Metadata),
+		authID:   exactAuthID(a),
 		model:    execModel,
 		modelReq: requestedModel,
 		route:    route,
@@ -362,6 +382,8 @@ func (t *callTelemetry) finish(nonStreamPayload []byte, status int, callErr erro
 		InflightAtDispatch: t.inflight,
 		Provider:           t.provider,
 		Account:            t.account,
+		SeatID:             t.seatID,
+		AuthID:             t.authID,
 		Model:              t.model,
 		ModelRequested:     t.modelReq,
 		Route:              t.route,

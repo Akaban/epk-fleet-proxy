@@ -33,6 +33,18 @@ func TestRequestExecutionMetadataIncludesPinnedAuthHeader(t *testing.T) {
 	}
 }
 
+func TestRequestExecutionMetadataIncludesSeatHeader(t *testing.T) {
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	ginCtx.Request.Header.Set("X-Seat-Id", "  epk9s.chief  ")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.SeatIDMetadataKey]; got != "epk9s.chief" {
+		t.Fatalf("SeatIDMetadataKey = %v, want %q", got, "epk9s.chief")
+	}
+}
+
 func TestRequestExecutionMetadataContextPinOverridesHeader(t *testing.T) {
 	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ginCtx.Request = httptest.NewRequest("POST", "/v1/messages", nil)

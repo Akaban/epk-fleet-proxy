@@ -41,6 +41,12 @@ var (
 	inFlight  atomic.Int32
 )
 
+// FleetEventsDSN returns the protected control-plane DSN for in-process
+// consumers such as seat-pin resolution. Callers must never log or serialize it.
+func FleetEventsDSN() string {
+	return proxyEventsDSN()
+}
+
 func proxyEventsDSN() string {
 	path := os.Getenv("EPK_PROXY_PG_ENV")
 	if path == "" {

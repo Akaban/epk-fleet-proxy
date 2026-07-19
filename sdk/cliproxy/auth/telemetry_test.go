@@ -144,6 +144,60 @@ func TestCallTelemetryReportsConfiguredRoutingStrategy(t *testing.T) {
 	}
 }
 
+func TestCallTelemetryMarksMissingSeatUnattributed(t *testing.T) {
+	m := &Manager{}
+	m.runtimeConfig.Store(&internalconfig.Config{TelemetryEnabled: true})
+
+	tel := m.beginCallTelemetry(nil, "claude", &Auth{ID: "auth-a"}, "model-a", "model-a", cliproxyexecutor.Options{})
+	if tel.seatID != "unattributed" {
+		t.Fatalf("seatID = %q, want unattributed", tel.seatID)
+	}
+	b, err := json.Marshal(llmCallEvent{SeatID: tel.seatID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"seat_id":"unattributed"`) {
+		t.Fatalf("unattributed seat_id missing from event: %s", b)
+	}
+}
+
+func TestCallTelemetryCarriesExactAuthIDSeparatelyFromAccount(t *testing.T) {
+	m := &Manager{}
+	m.runtimeConfig.Store(&internalconfig.Config{TelemetryEnabled: true})
+	auth := &Auth{
+		ID:       "codex-bryce@pyramind.ai-prolite.json",
+		Label:    "bryce@pyramind.ai",
+		FileName: "/runtime/auths/codex-bryce@pyramind.ai-prolite.json",
+	}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.SeatIDMetadataKey: "epk9s.chief",
+	}}
+	tel := m.beginCallTelemetry(nil, "codex", auth, "gpt-5.6-sol", "claude-fable-5", opts)
+	if tel.authID != auth.ID {
+		t.Fatalf("authID = %q, want exact manager ID %q", tel.authID, auth.ID)
+	}
+	if tel.account != auth.Label {
+		t.Fatalf("account = %q, want human label %q", tel.account, auth.Label)
+	}
+	if tel.seatID != "epk9s.chief" {
+		t.Fatalf("seatID = %q, want epk9s.chief", tel.seatID)
+	}
+	b, err := json.Marshal(llmCallEvent{SeatID: tel.seatID, AuthID: tel.authID, Account: tel.account})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := string(b)
+	if !strings.Contains(wire, `"seat_id":"epk9s.chief"`) {
+		t.Fatalf("seat_id missing from event: %s", wire)
+	}
+	if !strings.Contains(wire, `"auth_id":"codex-bryce@pyramind.ai-prolite.json"`) {
+		t.Fatalf("exact auth_id missing from event: %s", wire)
+	}
+	if !strings.Contains(wire, `"account":"bryce@pyramind.ai"`) {
+		t.Fatalf("account label missing from event: %s", wire)
+	}
+}
+
 func TestAccountSlugNeverSecret(t *testing.T) {
 	a := &Auth{ID: "id-1", FileName: "/home/x/.cli-proxy-api/codex-bryce@godfather.dev-pro.json"}
 	if got := accountSlug(a); got != "codex-bryce@godfather.dev-pro" {

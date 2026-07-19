@@ -256,6 +256,7 @@ type Manager struct {
 	// EPK_PROXY_DISABLED_PROVIDERS. The control plane changes the environment
 	// and restarts the targeted proxy to move the lever.
 	disabledProviders atomic.Value
+	seatPins          seatPinResolver
 
 	// requireFillFirst disables the upstream round-robin default for EPK proxy
 	// processes. When armed, any non-fill-first routing config returns a 4xx.
@@ -295,6 +296,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeRuntimeAuths: make(map[string]map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
+		seatPins:         &pgSeatPinResolver{},
 	}
 	// atomic.Value requires non-nil initial values.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1870,6 +1872,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 	var lastErr error
 	didRefreshOnUnauthorized := false
 	for idx, execModel := range execModels {
@@ -1916,7 +1919,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
+			if isRequestInvalidError(errStream) || strictPin {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1974,7 +1977,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
-			if idx < len(execModels)-1 {
+			if !strictPin && idx < len(execModels)-1 {
 				rerr := resultErrorFromError(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
@@ -1995,7 +1998,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 {
+			if !strictPin && idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
 			}
@@ -2383,6 +2386,10 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if err := m.resolveSeatPin(ctx, opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -2392,6 +2399,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		resp, errExec := m.executeMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errExec == nil {
 			return resp, nil
+		}
+		if strictPin {
+			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
@@ -2421,6 +2431,10 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if err := m.resolveSeatPin(ctx, opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -2430,6 +2444,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errExec == nil {
 			return resp, nil
+		}
+		if strictPin {
+			return cliproxyexecutor.Response{}, errExec
 		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
@@ -2453,6 +2470,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
+	if err := m.resolveSeatPin(ctx, opts); err != nil {
+		return nil, err
+	}
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
 
@@ -2462,6 +2483,13 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
 			return result, nil
+		}
+		if strictPin {
+			var bootstrapErr *streamBootstrapError
+			if errors.As(errStream, &bootstrapErr) && bootstrapErr != nil {
+				return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
+			}
+			return nil, errStream
 		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
@@ -2587,6 +2615,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -2633,6 +2662,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if errPrepare != nil {
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
+			if strictPin {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			lastErr = errPrepare
 			continue
 		}
@@ -2684,7 +2716,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
+				if isRequestInvalidError(errExec) || strictPin {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2714,6 +2746,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -2760,6 +2793,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if errPrepare != nil {
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
+			if strictPin {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			lastErr = errPrepare
 			continue
 		}
@@ -2811,7 +2847,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
+				if isRequestInvalidError(errExec) || strictPin {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -2841,6 +2877,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	routeModel := authSelectionModelFromOptions(opts, req.Model)
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	strictPin := pinnedAuthIDFromMetadata(opts.Metadata) != ""
 	homeMode := m.HomeEnabled()
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
@@ -2885,6 +2922,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errPrepare != nil {
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
+			if strictPin {
+				return nil, errPrepare
+			}
 			lastErr = errPrepare
 			continue
 		}
@@ -2898,7 +2938,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if isRequestInvalidError(errStream) {
+			if isRequestInvalidError(errStream) || strictPin {
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -4795,6 +4835,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	if err := m.routingStrategyError(); err != nil {
 		return nil, nil, err
 	}
+	if err := m.resolveSeatPin(ctx, opts); err != nil {
+		return nil, nil, err
+	}
 	if m.providerDisabled(provider) {
 		return nil, nil, providerDisabledError(provider)
 	}
@@ -4964,6 +5007,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if err := m.routingStrategyError(); err != nil {
+		return nil, nil, "", err
+	}
+	if err := m.resolveSeatPin(ctx, opts); err != nil {
 		return nil, nil, "", err
 	}
 	enabledProviders, hadDisabledProvider := m.enabledProviders(providers)
@@ -5393,6 +5439,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	}
 	if strings.TrimSpace(auth.ID) == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
+	}
+	if pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata); pinnedAuthID != "" && auth.ID != pinnedAuthID {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "home returned a different auth than the request pin", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	if homeAuthAlreadyTried(tried, auth.ID) {
 		return nil, nil, "", repeatedHomeAuthError()
