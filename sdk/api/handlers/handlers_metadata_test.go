@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"golang.org/x/net/context"
 )
@@ -16,6 +18,31 @@ func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t
 	}
 	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
 		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
+	}
+}
+
+func TestRequestExecutionMetadataIncludesPinnedAuthHeader(t *testing.T) {
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	ginCtx.Request.Header.Set("X-Pinned-Auth", "  auth-from-header  ")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.PinnedAuthMetadataKey]; got != "auth-from-header" {
+		t.Fatalf("PinnedAuthMetadataKey = %v, want %q", got, "auth-from-header")
+	}
+}
+
+func TestRequestExecutionMetadataContextPinOverridesHeader(t *testing.T) {
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	ginCtx.Request.Header.Set("X-Pinned-Auth", "auth-from-header")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	ctx = WithPinnedAuthID(ctx, "auth-from-context")
+
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.PinnedAuthMetadataKey]; got != "auth-from-context" {
+		t.Fatalf("PinnedAuthMetadataKey = %v, want %q", got, "auth-from-context")
 	}
 }
 

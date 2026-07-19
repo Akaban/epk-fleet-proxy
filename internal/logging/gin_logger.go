@@ -4,8 +4,11 @@
 package logging
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -51,14 +54,44 @@ func GinLogrusLogger() gin.HandlerFunc {
 
 		// Only generate request ID for AI API paths
 		var requestID string
+		slug := "unknown"
 		if isAIAPIPath(path) {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
 			c.Request = c.Request.WithContext(ctx)
+			// fleet observability: model slug best-effort peek (first 1MB),
+			// full stream restored so handlers see the untouched body.
+			inFlight.Add(1)
+			if c.Request.Body != nil {
+				if head, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)); err == nil {
+					c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(head), c.Request.Body))
+					var m struct {
+						Model string `json:"model"`
+					}
+					if json.Unmarshal(head, &m) == nil && m.Model != "" {
+						slug = m.Model
+					}
+				}
+			}
 		}
 
 		c.Next()
+
+		// fleet observability: one event per AI-API request, non-blocking,
+		// fail-open (proxy_events.go). Runs before any skip-logging return.
+		if requestID != "" {
+			inFlight.Add(-1)
+			publishProxyEvent(proxyEvent{
+				ID:        requestID,
+				TS:        time.Now().UnixMilli(),
+				Slug:      slug,
+				Status:    c.Writer.Status(),
+				LatencyMS: time.Since(start).Milliseconds(),
+				InFlight:  inFlight.Load(),
+				Client:    c.ClientIP(),
+			})
+		}
 
 		if shouldSkipGinRequestLogging(c) {
 			return

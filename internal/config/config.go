@@ -59,6 +59,21 @@ type Config struct {
 	// CommercialMode disables high-overhead request logging and HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
 
+	// MaxInFlightPerCredential caps concurrent upstream requests per credential
+	// (auth file); excess requests queue locally until a slot frees or the
+	// client disconnects. 0 disables the cap.
+	MaxInFlightPerCredential int `yaml:"max-inflight-per-credential" json:"max-inflight-per-credential"`
+
+	// TelemetryEnabled turns on per-call fleet telemetry (llm.call events +
+	// the in-flight gauge) published to pgmq proxy.events. Off by default;
+	// the publisher additionally requires the pg-env DSN file to exist.
+	TelemetryEnabled bool `yaml:"telemetry-enabled" json:"telemetry-enabled"`
+
+	// TelemetryPricing maps "provider/model" (or bare model) to $/Mtok rates
+	// used to compute llm.call cost_usd. A model absent from this table emits
+	// cost_usd null with unknown_reason "no_price" — never $0.00.
+	TelemetryPricing map[string]ModelPrice `yaml:"telemetry-pricing" json:"telemetry-pricing"`
+
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
 
@@ -2012,4 +2027,16 @@ func removeLegacyAuthBlock(root *yaml.Node) {
 		return
 	}
 	removeMapKey(root, "auth")
+}
+
+// ModelPrice holds $/Mtok rates for one model (telemetry cost computation).
+type ModelPrice struct {
+	// Input is the $/Mtok rate for non-cached input tokens.
+	Input float64 `yaml:"input" json:"input"`
+	// Output is the $/Mtok rate for output tokens.
+	Output float64 `yaml:"output" json:"output"`
+	// CacheRead is the $/Mtok rate for cache-read input tokens.
+	CacheRead float64 `yaml:"cache-read" json:"cache-read"`
+	// CacheWrite is the $/Mtok rate for cache-write input tokens.
+	CacheWrite float64 `yaml:"cache-write" json:"cache-write"`
 }

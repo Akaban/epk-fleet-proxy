@@ -511,6 +511,18 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+
+	// Fleet telemetry: live per-(account,agent) concurrency gauge poll
+	// endpoint (contract v1.2 A1). Same inbound auth as the AI routes.
+	v0 := s.engine.Group("/v0")
+	v0.Use(AuthMiddleware(s.accessManager))
+	v0.GET("/gauge", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"ts":    time.Now().UTC(),
+			"cells": auth.FleetGaugeSnapshot(),
+		})
+	})
+
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)

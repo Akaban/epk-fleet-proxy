@@ -248,6 +248,19 @@ type Manager struct {
 	// modelPoolOffsets tracks per-auth alias pool rotation state.
 	modelPoolOffsets map[string]int
 
+	// inflight caps concurrent upstream requests per credential; excess
+	// requests queue locally (max-inflight-per-credential).
+	inflight perAuthInFlightLimiter
+
+	// disabledProviders is the immutable startup gate parsed from
+	// EPK_PROXY_DISABLED_PROVIDERS. The control plane changes the environment
+	// and restarts the targeted proxy to move the lever.
+	disabledProviders atomic.Value
+
+	// requireFillFirst disables the upstream round-robin default for EPK proxy
+	// processes. When armed, any non-fill-first routing config returns a 4xx.
+	requireFillFirst bool
+
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
@@ -283,8 +296,10 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 	}
-	// atomic.Value requires non-nil initial value.
+	// atomic.Value requires non-nil initial values.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
+	manager.disabledProviders.Store(disabledProvidersFromEnv())
+	manager.requireFillFirst = envTruthy(requireFillFirstEnv)
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
@@ -512,6 +527,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.inflight.setLimit(cfg.MaxInFlightPerCredential)
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -1865,9 +1881,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		tel := m.beginCallTelemetry(ctx, provider, auth, execReq.Model, routeModel, execOpts)
+		tel.markQueued()
+		releaseSlot, errSlot := m.inflight.acquire(ctx, auth.ID)
+		if errSlot != nil {
+			tel.finish(nil, 0, errSlot)
+			return nil, errSlot
+		}
+		tel.markDispatched()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				releaseSlot()
+				tel.finish(nil, 0, errCtx)
 				return nil, errCtx
 			}
 			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
@@ -1876,12 +1902,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 				if errStream != nil {
 					if errCtx := ctx.Err(); errCtx != nil {
+						releaseSlot()
+						tel.finish(nil, 0, errCtx)
 						return nil, errCtx
 					}
 				}
 			}
 		}
 		if errStream != nil {
+			releaseSlot()
+			tel.finish(nil, 0, errStream)
 			rerr := resultErrorFromError(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
@@ -1893,6 +1923,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
+		// The slot stays held for the life of the stream; it frees when the
+		// upstream chunk channel closes (or is drained by discardStreamChunks).
+		// The same forwarder taps chunks for telemetry (ttfb, usage) and
+		// emits the terminal event on close.
+		streamResult = holdSlotThroughStream(streamResult, releaseSlot, tel)
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -1903,15 +1938,29 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				auth = refreshed
 				didRefreshOnUnauthorized = true
+				// The refresh retry is its own upstream attempt: the first
+				// attempt's telemetry was finished by its forwarder when
+				// discardStreamChunks drained it (401 recorded); this one
+				// gets a fresh event.
+				retryTel := m.beginCallTelemetry(ctx, provider, auth, execReq.Model, routeModel, execOpts)
+				retryTel.markQueued()
+				retrySlot, errRetrySlot := m.inflight.acquire(ctx, auth.ID)
+				if errRetrySlot != nil {
+					retryTel.finish(nil, 0, errRetrySlot)
+					return nil, errRetrySlot
+				}
+				retryTel.markDispatched()
 				retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 				if retryErr != nil {
+					retrySlot()
+					retryTel.finish(nil, 0, retryErr)
 					if errCtx := ctx.Err(); errCtx != nil {
 						return nil, errCtx
 					}
 					bootstrapErr = retryErr
 					streamResult = &cliproxyexecutor.StreamResult{}
 				} else {
-					streamResult = retryStream
+					streamResult = holdSlotThroughStream(retryStream, retrySlot, retryTel)
 					buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
 				}
 			}
@@ -2598,9 +2647,19 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			tel := m.beginCallTelemetry(execCtx, provider, auth, execReq.Model, routeModel, execOpts)
+			tel.markQueued()
+			releaseSlot, errSlot := m.inflight.acquire(execCtx, auth.ID)
+			if errSlot != nil {
+				tel.finish(nil, 0, errSlot)
+				return cliproxyexecutor.Response{}, errSlot
+			}
+			tel.markDispatched()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseSlot()
+					tel.finish(nil, 0, errCtx)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -2609,11 +2668,15 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							releaseSlot()
+							tel.finish(nil, 0, errCtx)
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
 			}
+			releaseSlot()
+			tel.finish(resp.Payload, 0, errExec)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -2711,9 +2774,19 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			tel := m.beginCallTelemetry(execCtx, provider, auth, execReq.Model, routeModel, execOpts)
+			tel.markQueued()
+			releaseSlot, errSlot := m.inflight.acquire(execCtx, auth.ID)
+			if errSlot != nil {
+				tel.finish(nil, 0, errSlot)
+				return cliproxyexecutor.Response{}, errSlot
+			}
+			tel.markDispatched()
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					releaseSlot()
+					tel.finish(nil, 0, errCtx)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -2722,11 +2795,15 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 					if errExec != nil {
 						if errCtx := execCtx.Err(); errCtx != nil {
+							releaseSlot()
+							tel.finish(nil, 0, errCtx)
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
 				}
 			}
+			releaseSlot()
+			tel.finish(resp.Payload, 0, errExec)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
@@ -4715,6 +4792,12 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	if err := m.routingStrategyError(); err != nil {
+		return nil, nil, err
+	}
+	if m.providerDisabled(provider) {
+		return nil, nil, providerDisabledError(provider)
+	}
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -4880,6 +4963,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if err := m.routingStrategyError(); err != nil {
+		return nil, nil, "", err
+	}
+	enabledProviders, hadDisabledProvider := m.enabledProviders(providers)
+	if len(enabledProviders) == 0 && hadDisabledProvider {
+		return nil, nil, "", providerDisabledError(strings.Join(providers, ","))
+	}
+	providers = enabledProviders
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
