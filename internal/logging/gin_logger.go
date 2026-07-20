@@ -58,7 +58,11 @@ func GinLogrusLogger() gin.HandlerFunc {
 		if isAIAPIPath(path) {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
-			ctx := WithRequestID(c.Request.Context(), requestID)
+			// Also install a selected-auth holder so the auth chosen during
+			// execution can be read back here after c.Next() and stamped on the
+			// minimal proxy.event (order 1005). GetContextWithCancel bridges this
+			// holder into the separate execution context.
+			ctx := WithSelectedAuthHolder(WithRequestID(c.Request.Context(), requestID))
 			c.Request = c.Request.WithContext(ctx)
 			// fleet observability: model slug best-effort peek (first 1MB),
 			// full stream restored so handlers see the untouched body.
@@ -82,6 +86,10 @@ func GinLogrusLogger() gin.HandlerFunc {
 		// fail-open (proxy_events.go). Runs before any skip-logging return.
 		if requestID != "" {
 			inFlight.Add(-1)
+			// The credential selected during execution (empty when none was —
+			// e.g. auth failures before selection). credSlug/credEmail collapse
+			// "" to "", so omitempty drops the fields on unselected requests.
+			authID := GetSelectedAuth(c.Request.Context())
 			publishProxyEvent(proxyEvent{
 				ID:        requestID,
 				TS:        time.Now().UnixMilli(),
@@ -90,6 +98,9 @@ func GinLogrusLogger() gin.HandlerFunc {
 				LatencyMS: time.Since(start).Milliseconds(),
 				InFlight:  inFlight.Load(),
 				Client:    c.ClientIP(),
+				AuthID:    authID,
+				Account:   credSlug(authID),
+				Email:     credEmail(authID),
 			})
 		}
 

@@ -30,6 +30,13 @@ type proxyEvent struct {
 	LatencyMS int64  `json:"latency_ms"`
 	InFlight  int32  `json:"in_flight"`
 	Client    string `json:"client"`
+	// Per-account identity of the credential SELECTED for this request (founder
+	// msg 971 / order 1005). Empty when no auth was selected (e.g. 401s) — that
+	// null is legitimate, not a gap. Stamped by the gin middleware from the
+	// selected-auth holder after c.Next().
+	AuthID  string `json:"auth_id,omitempty"`
+	Account string `json:"account,omitempty"`
+	Email   string `json:"email,omitempty"`
 }
 
 var (

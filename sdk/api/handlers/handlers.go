@@ -292,8 +292,20 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if seatHeader != "" {
 		meta[coreexecutor.SeatIDMetadataKey] = seatHeader
 	}
-	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
-		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
+	// The executor invokes SelectedAuthCallbackMetadataKey with the chosen auth
+	// ID. Compose any handler-registered callback with a sink that records the
+	// selection on the request's selected-auth holder, so the gin middleware can
+	// stamp identity on the minimal per-request event (order 1005). The
+	// high-volume chat/messages handlers register no callback of their own — this
+	// single site covers them because the holder alone is enough to opt in.
+	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil || logging.HasSelectedAuthHolder(ctx) {
+		callbackCtx := ctx
+		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
+			if selectedCallback != nil {
+				selectedCallback(authID)
+			}
+			logging.SetSelectedAuth(callbackCtx, authID)
+		}
 	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
@@ -591,6 +603,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
+	// Bridge the request context's selected-auth holder (installed by the gin
+	// request-logging middleware) into this execution context, so the auth
+	// selected during execution is visible to the middleware reading the request
+	// context after c.Next() (order 1005 — stamp identity on the minimal event).
+	if requestCtx != nil {
+		newCtx = logging.SelectedAuthHolderInto(requestCtx, newCtx)
+	}
 
 	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
