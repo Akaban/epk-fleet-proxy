@@ -5,6 +5,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 )
 
@@ -16,6 +19,23 @@ type errorEvent struct {
 	AuthIndex  string               `json:"auth_index"`
 	StatusCode int                  `json:"status_code"`
 	Body       string               `json:"body"`
+	Code       string               `json:"code,omitempty"`
+	Retryable  bool                 `json:"retryable,omitempty"`
+	AuthStatus errorEventAuthStatus `json:"auth_status"`
+}
+
+type authStateEvent struct {
+	V          int                  `json:"v"`
+	Kind       string               `json:"kind"`
+	EventID    string               `json:"event_id"`
+	Timestamp  time.Time            `json:"timestamp"`
+	Provider   string               `json:"provider,omitempty"`
+	Model      string               `json:"model,omitempty"`
+	AuthID     string               `json:"auth_id"`
+	Account    string               `json:"account"`
+	Email      string               `json:"email"`
+	Outcome    string               `json:"outcome"`
+	StatusCode int                  `json:"status_code"`
 	Code       string               `json:"code,omitempty"`
 	Retryable  bool                 `json:"retryable,omitempty"`
 	AuthStatus errorEventAuthStatus `json:"auth_status"`
@@ -56,6 +76,69 @@ func (m *Manager) publishErrorEvent(result Result, authSnapshot *Auth) {
 		return
 	}
 	redisqueue.EnqueueError(payload)
+}
+
+func (m *Manager) publishAuthStateEvent(result Result, authSnapshot *Auth, changed bool) {
+	if m == nil || m.HomeEnabled() {
+		return
+	}
+	event, ok := buildAuthStateEvent(result, authSnapshot, changed)
+	if !ok {
+		return
+	}
+	logging.PublishFleetEvent(event)
+}
+
+func buildAuthStateEvent(result Result, authSnapshot *Auth, changed bool) (authStateEvent, bool) {
+	if authSnapshot == nil || (!changed && result.Success) {
+		return authStateEvent{}, false
+	}
+	statusCode := 200
+	outcome := "recovered"
+	code := ""
+	retryable := false
+	if !result.Success {
+		statusCode = errorEventStatusCode(result.Error)
+		outcome = "error"
+		if result.Error != nil {
+			code = strings.TrimSpace(result.Error.Code)
+			retryable = result.Error.Retryable
+		}
+	}
+	return authStateEvent{
+		V:          1,
+		Kind:       "proxy.auth.state",
+		EventID:    uuid.NewString(),
+		Timestamp:  time.Now().UTC(),
+		Provider:   strings.TrimSpace(result.Provider),
+		Model:      strings.TrimSpace(result.Model),
+		AuthID:     strings.TrimSpace(result.AuthID),
+		Account:    credSlug(result.AuthID),
+		Email:      credEmail(result.AuthID),
+		Outcome:    outcome,
+		StatusCode: statusCode,
+		Code:       code,
+		Retryable:  retryable,
+		AuthStatus: buildErrorEventAuthStatus(result.Model, authSnapshot),
+	}, true
+}
+
+func authStateNeedsRecovery(auth *Auth, model string) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Disabled || auth.Unavailable || auth.Status != StatusActive ||
+		!auth.NextRetryAfter.IsZero() || auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.IsZero() {
+		return true
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || auth.ModelStates == nil {
+		return false
+	}
+	state := auth.ModelStates[model]
+	return state != nil && (state.Unavailable || state.Status != StatusActive ||
+		!state.NextRetryAfter.IsZero() || state.Quota.Exceeded || !state.Quota.NextRecoverAt.IsZero() ||
+		state.LastError != nil)
 }
 
 func buildErrorEventPayload(result Result, authSnapshot *Auth) ([]byte, bool) {

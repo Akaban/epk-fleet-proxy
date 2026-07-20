@@ -100,6 +100,63 @@ func TestManagerMarkResultPublishesErrorEventAfterAuthStateUpdate(t *testing.T) 
 	}
 }
 
+func TestBuildAuthStateEventCarriesCooldownAndRecovery(t *testing.T) {
+	next := time.Now().Add(5 * time.Minute).UTC()
+	cooling := &Auth{
+		ID:             "auth-state-event",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+			BackoffLevel:  2,
+		},
+		ModelStates: map[string]*ModelState{
+			"claude-fable-5": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: next, BackoffLevel: 2},
+			},
+		},
+	}
+	failure, ok := buildAuthStateEvent(Result{
+		AuthID:   cooling.ID,
+		Provider: "claude",
+		Model:    "claude-fable-5",
+		Success:  false,
+		Error:    &Error{Code: "rate_limit", Retryable: true, HTTPStatus: http.StatusTooManyRequests},
+	}, cooling, true)
+	if !ok {
+		t.Fatal("failure state event was not built")
+	}
+	if failure.Kind != "proxy.auth.state" || failure.Outcome != "error" || failure.StatusCode != 429 {
+		t.Fatalf("unexpected failure event: %+v", failure)
+	}
+	if failure.AuthStatus.NextRetryAfter == nil || !failure.AuthStatus.NextRetryAfter.Equal(next) {
+		t.Fatalf("next retry = %v, want %v", failure.AuthStatus.NextRetryAfter, next)
+	}
+	if failure.AuthStatus.Quota == nil || !failure.AuthStatus.Quota.Exceeded || failure.AuthStatus.Quota.BackoffLevel != 2 {
+		t.Fatalf("unexpected quota state: %+v", failure.AuthStatus.Quota)
+	}
+
+	recovered := &Auth{ID: cooling.ID, Status: StatusActive}
+	recovery, ok := buildAuthStateEvent(Result{
+		AuthID: cooling.ID, Provider: "claude", Model: "claude-fable-5", Success: true,
+	}, recovered, true)
+	if !ok || recovery.Outcome != "recovered" || recovery.StatusCode != 200 {
+		t.Fatalf("unexpected recovery event: %+v ok=%t", recovery, ok)
+	}
+	if recovery.AuthStatus.Unavailable || recovery.AuthStatus.NextRetryAfter != nil || recovery.AuthStatus.Quota != nil {
+		t.Fatalf("recovery kept stale cooldown state: %+v", recovery.AuthStatus)
+	}
+	if _, ok = buildAuthStateEvent(Result{AuthID: cooling.ID, Success: true}, recovered, false); ok {
+		t.Fatal("unchanged healthy success emitted a state event")
+	}
+}
+
 func TestManagerMarkResultSkipsErrorEventInHomeMode(t *testing.T) {
 	withEnabledErrorQueue(t)
 	subscriber, unsubscribe := redisqueue.SubscribeErrors()

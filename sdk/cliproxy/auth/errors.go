@@ -30,6 +30,12 @@ func (e *Error) StatusCode() int {
 	if e == nil {
 		return 0
 	}
+	// provider_not_found means the request named no resolvable provider (or an
+	// unregistered one): a client/config error, never upstream unavailability.
+	// Without this floor it defaults to 5xx (500/503) and mislabels the failure.
+	if e.HTTPStatus == 0 && e.Code == "provider_not_found" {
+		return 400
+	}
 	return e.HTTPStatus
 }
 

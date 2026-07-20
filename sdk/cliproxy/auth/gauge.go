@@ -15,6 +15,7 @@ import (
 
 type FleetGaugeCell struct {
 	Account  string `json:"account"`
+	Email    string `json:"email"`
 	Agent    string `json:"agent,omitempty"`
 	Inflight int    `json:"inflight"`
 	Queued   int    `json:"queued"`
@@ -33,7 +34,7 @@ func fleetGaugeCell(account, agent string) *FleetGaugeCell {
 	k := fleetGaugeKey{account, agent}
 	c, ok := fleetGauge.cells[k]
 	if !ok {
-		c = &FleetGaugeCell{Account: account, Agent: agent}
+		c = &FleetGaugeCell{Account: account, Email: credEmail(account), Agent: agent}
 		fleetGauge.cells[k] = c
 	}
 	return c

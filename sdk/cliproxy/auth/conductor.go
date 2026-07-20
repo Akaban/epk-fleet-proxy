@@ -3827,10 +3827,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	publishAuthState := !result.Success
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		if result.Success && authStateNeedsRecovery(auth, result.Model) {
+			publishAuthState = true
+		}
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
@@ -4002,6 +4006,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+	m.publishAuthStateEvent(result, authSnapshot, publishAuthState)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

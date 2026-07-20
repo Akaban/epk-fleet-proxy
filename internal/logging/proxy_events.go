@@ -33,12 +33,13 @@ type proxyEvent struct {
 }
 
 var (
-	peOnce    sync.Once
-	peCh      chan string
-	peEnabled atomic.Bool
-	peDrops   atomic.Int64
-	peSent    atomic.Int64
-	inFlight  atomic.Int32
+	peOnce            sync.Once
+	peCh              chan string
+	peEnabled         atomic.Bool
+	peDrops           atomic.Int64
+	peSent            atomic.Int64
+	peProjectionDrops atomic.Int64
+	inFlight          atomic.Int32
 )
 
 // FleetEventsDSN returns the protected control-plane DSN for in-process
@@ -129,6 +130,7 @@ func proxyEventsWriter(dsn string) {
 		}
 	}
 	sendSQL := `select pgmq.send_batch('` + queue + `', $1::jsonb[])`
+	observeSQL := `select epk.epk_proxy_observe_events($1::jsonb[])`
 	batch := make([]string, 0, 64)
 	flush := func() {
 		if len(batch) == 0 {
@@ -153,6 +155,9 @@ func proxyEventsWriter(dsn string) {
 			conn = nil
 		} else {
 			peSent.Add(int64(len(batch)))
+			if _, errObserve := conn.Exec(ctx, observeSQL, msgs); errObserve != nil {
+				peProjectionDrops.Add(int64(len(batch)))
+			}
 		}
 		batch = batch[:0]
 	}
@@ -169,5 +174,9 @@ func proxyEventsWriter(dsn string) {
 	}
 }
 
-// ProxyEventStats exposes sent/dropped counters (management/debug surfaces).
+// ProxyEventStats exposes raw telemetry sent/dropped counters.
 func ProxyEventStats() (sent, dropped int64) { return peSent.Load(), peDrops.Load() }
+
+// ProxyProjectionDrops counts events whose raw PGMQ write succeeded but whose
+// immediate control-plane projection failed. Raw telemetry remains replayable.
+func ProxyProjectionDrops() int64 { return peProjectionDrops.Load() }

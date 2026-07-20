@@ -55,6 +55,7 @@ type llmCallEvent struct {
 	InflightAtDispatch int       `json:"inflight_at_dispatch"`
 	Provider           string    `json:"provider"`
 	Account            string    `json:"account"`
+	Email              string    `json:"email"`
 	SeatID             string    `json:"seat_id"`
 	AuthID             string    `json:"auth_id"`
 	Model              string    `json:"model"`
@@ -82,6 +83,7 @@ type callTelemetry struct {
 	inflight int
 	provider string
 	account  string
+	email    string
 	seatID   string
 	authID   string
 	model    string
@@ -198,6 +200,7 @@ func (m *Manager) beginCallTelemetry(ctx context.Context, provider string, a *Au
 		tsStart:  time.Now(),
 		provider: provider,
 		account:  accountSlug(a),
+		email:    firstEmail(exactAuthID(a), accountSlug(a)),
 		seatID:   telemetrySeatID(opts.Metadata),
 		authID:   exactAuthID(a),
 		model:    execModel,
@@ -382,6 +385,7 @@ func (t *callTelemetry) finish(nonStreamPayload []byte, status int, callErr erro
 		InflightAtDispatch: t.inflight,
 		Provider:           t.provider,
 		Account:            t.account,
+		Email:              t.email,
 		SeatID:             t.seatID,
 		AuthID:             t.authID,
 		Model:              t.model,
